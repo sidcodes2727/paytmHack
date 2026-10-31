@@ -130,6 +130,10 @@ def evaluate_payment_failure(customer_id: str, row: dict, claim: ClaimedContext,
                "Records disagree: " + ", ".join(f.replace("_", " ").lower() for f in disc["findings"]),
                "MULTI_SYSTEM_DISCREPANCY")
     for m in cvf["mismatches"]:
+        if m["field"] == "status":
+            ck.add("SCREENSHOT_STATUS", "Screenshot status agrees with the ledger", "SCREENSHOT", "FAIL",
+                   f"Screenshot says {str(m['claimed']).lower()}, but the ledger says {str(m['ledger']).lower().replace('_', ' ')}",
+                   "SCREENSHOT_LEDGER_MISMATCH")
         if m["field"] == "text_amount":
             ck.add("CLAIMED_AMOUNT", "Amount the customer quoted", "CUSTOMER_TEXT", "FAIL",
                    f"Said {inr(m['claimed'])}, ledger shows {inr(m['ledger'])}", "SCREENSHOT_LEDGER_MISMATCH")
@@ -156,7 +160,7 @@ def evaluate_merchant(customer_id: str, row: dict, order: MerchantOrder | None, 
     ck = _Checks()
     _common(ck, customer_id, row, claim, history)
     reason = claimed_reason(claim.combined_text)
-    text_amounts = extract_amounts(strip_refs(claim.combined_text, claim.refs))
+    text_amounts = extract_amounts(strip_refs(f"{claim.raw_text} {claim.voice_transcript}", claim.refs))   # typed/spoken only, not OCR noise
     base = {"kind": "MERCHANT_REFUND", "claimed_reason": reason, "amount_paid": row["verified_amount"],
             "risk": _risk(history)}
 

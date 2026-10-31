@@ -104,7 +104,9 @@ def post_message(cid: str, text: str, *, choice: dict | None = None, voice_mode:
         cases = {c["txn_id"]: c for c in orc.customer_cases(cid)}
         open_cases = [c for c in cases.values() if c["state"] != "VERIFIED_CLOSED" and not c.get("outcome")]
 
-        if attachment and not text:
+        # A screenshot alone is enough when OCR could read it; only ask what's wrong when it couldn't.
+        readable = ((attachment or {}).get("ocr") or {}).get("amount") is not None
+        if attachment and not text and not readable:
             if open_cases:
                 c = open_cases[0]
                 stored = ledger_db.load_case(c["txn_id"])
@@ -122,8 +124,9 @@ def post_message(cid: str, text: str, *, choice: dict | None = None, voice_mode:
         attachment = attachment or pend_att
         # References the customer quoted (PNR / order ID / payment RRN). They tell us where to look; the claim verifier
         # later checks each one against the records, so quoting someone else's booking is caught, not trusted.
-        order_refs = merchant_rails.refs_in_text(text)
-        rrns = claim_verifier.rrns_in_text(text)
+        shot_text = ((attachment or {}).get("ocr") or {}).get("embedded_text") or ""   # a screenshot is just another claim
+        order_refs = merchant_rails.refs_in_text(f"{text} {shot_text}")
+        rrns = claim_verifier.rrns_in_text(f"{text} {shot_text}")
         refs = [r["ref"] for r in order_refs] + rrns
         amounts = extract_amounts(strip_refs(text, refs))
         ocr_amt = ((attachment or {}).get("ocr") or {}).get("amount")

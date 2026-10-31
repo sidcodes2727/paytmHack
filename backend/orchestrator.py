@@ -80,9 +80,26 @@ def _refresh(case: dict) -> dict:
 
 
 # ------------------------------------------------------------------ customer-facing copy
+def contradiction_text(case: dict) -> str:
+    """Customer copy when their claim (screenshot / quoted amount / quoted payment) contradicts the bank ledger."""
+    m = case["claim_vs_fact"]["mismatches"][0]
+    amt = inr(case["verified"]["verified_amount"])
+    who = case["counterparty"].split(" (")[0]
+    if m["field"] == "payment_ref":
+        return ("Aapne jo payment reference bataya wo kisi doosre account ke payment ka hai, aapke account ka nahi. "
+                "Isliye is par refund process nahi ho sakta. Case specialist review me bheja gaya hai.")
+    if m["field"] == "status":
+        return (f"Aapke screenshot me payment 'failed' dikh raha hai, lekin bank records ke hisaab se {amt} ka payment {who} ko "
+                f"successfully credit ho chuka hai. Isliye refund process nahi ho sakta. Case specialist review me bheja gaya hai.")
+    return (f"Aapne jo amount bataya (₹{float(m['claimed']):,.0f}) wo bank records ({inr(m['ledger'])}) se match nahi karta. "
+            f"Case specialist review me bheja gaya hai; 24 ghante me update denge.")
+
+
 def status_text(case: dict) -> str:
     if case.get("kind") == "MERCHANT_REFUND":
         return merchant_text(case)
+    if case.get("outcome") == "CLAIM_CONTRADICTED":
+        return contradiction_text(case)
     amt = inr(case["verified"]["verified_amount"])
     p = case.get("promise")
     when = fmt_when(p["draft"]["by_when"]) if p else None
@@ -119,13 +136,8 @@ def _ack(case: dict) -> str:
     if out == "NO_REFUND_DUE":
         return (f"Maine check kiya: {amt} ka payment {who} ko {fmt_when(case['verified']['txn_timestamp'])} "
                 f"par successfully credit ho chuka hai. Isliye refund due nahi hai. Kuch aur madad chahiye to batayein.")
-    if "SCREENSHOT_LEDGER_MISMATCH" in codes:
-        m = case["claim_vs_fact"]["mismatches"][0]
-        if m["field"] == "payment_ref":
-            return ("Aapne jo payment reference bataya wo kisi doosre account ke payment ka hai, aapke account ka nahi. "
-                    "Isliye is par refund process nahi ho sakta. Case specialist review me bheja gaya hai.")
-        return (f"Aapne jo amount bataya (₹{m['claimed']:,.0f}) wo bank records ({inr(m['ledger'])}) se match nahi karta. "
-                f"Case specialist review me bheja gaya hai; 24 ghante me update denge.")
+    if out == "CLAIM_CONTRADICTED" or "SCREENSHOT_LEDGER_MISMATCH" in codes:
+        return contradiction_text(case)
     p = case["promise"]["draft"]
     if case["state"] == "AWAITING_PROOF":
         return (f"Maine aapka {amt} ka payment ({who} ko) check kar liya — reversal pending tha. "
@@ -235,6 +247,11 @@ def triage_summary(case: dict) -> dict:
             "NEEDS_REVIEW": {"label": "Manual review", "tone": "amber", "text": "A chargeback is open on the same payment."},
         }[ev["verdict"]]
     n = case["nirnay"]
+    if case.get("outcome") == "CLAIM_CONTRADICTED":
+        m = case["claim_vs_fact"]["mismatches"][0]
+        return {"label": "Claim contradicted", "tone": "red",
+                "text": "The screenshot or quoted details conflict with the bank ledger. No LLM call, no promise made." if m["field"] != "payment_ref"
+                else "The quoted payment belongs to a different account. No LLM call, no promise made."}
     if case.get("outcome") == "CONTAINED":
         return {"label": "Contained", "tone": "red", "text": "Prompt-injection attempt detected in customer input. Never reached an LLM."}
     if case.get("outcome") == "NO_REFUND_DUE":
@@ -344,6 +361,11 @@ def open_case(customer_id: str, txn_id: str, text: str, *, voice_transcript: str
         _event(case, "CLAIM_VERIFIED", {"verdict": ev["verdict"], "codes": ev["codes"], "amount_due": ev.get("amount_due"),
                                         "sources": sorted({c["source"] for c in ev["checks"]})})
         _merchant_decide(case)
+    elif cvf["claim_ledger_mismatch"]:
+        # The customer's evidence contradicts the ledger: settle it locally, no LLM and no promise.
+        case["outcome"] = "CLAIM_CONTRADICTED"
+        case["gate"] = policy_gate.evaluate_action(txn_id, "execute_refund", EXEC_TOKEN, claim_ledger_mismatch=True)
+        _event(case, "POLICY_BLOCK", {"reason_codes": case["gate"]["reason_codes"]})
     elif v.failure_stage == "NONE" and not cvf["claim_ledger_mismatch"]:
         case["outcome"] = "NO_REFUND_DUE"
         case["gate"] = policy_gate.evaluate_action(txn_id, "execute_refund", EXEC_TOKEN)

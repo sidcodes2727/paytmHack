@@ -64,35 +64,43 @@ def parse_receipt_text(text: str) -> dict:
     return {"amount": amt, "utr": u.group(1) if u else None, "status": status}
 
 
+def _doc_ai_once(image_bytes: bytes, filename: str, h: dict) -> str:
+    base = DOC_AI.rsplit("/", 1)[0]
+    mime = "image/jpeg" if filename.lower().endswith((".jpg", ".jpeg")) else "image/png"
+    r = httpx.post(DOC_AI, headers=h, timeout=30, files={"file": (filename, image_bytes, mime)}, data={"language": "en-IN"})
+    r.raise_for_status()
+    jid = r.json()["job_id"]
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        st = httpx.get(f"{base}/{jid}/status", headers=h, timeout=15).json().get("status")
+        if st in ("completed", "partially_completed"):
+            break
+        if st in ("failed", "rejected"):
+            raise RuntimeError(f"doc-ai job {st}")
+        time.sleep(1.0)
+    else:
+        raise TimeoutError("doc-ai job did not finish in 40s")
+    res = httpx.get(f"{base}/{jid}/results", headers=h, params={"format": "json"}, timeout=30)
+    res.raise_for_status()
+    return "\n".join(b["text"] for d in res.json().get("documents", []) for p in d.get("pages", [])
+                     for b in p.get("blocks", []) if b.get("text"))
+
+
 def document_ocr(image_bytes: bytes | None, cached: dict, filename: str = "screenshot.png") -> dict:
-    """Sarvam Document Intelligence (doc-ai): upload -> poll -> results(json) -> parse text blocks."""
+    """Sarvam Document Intelligence (doc-ai): upload -> poll -> results(json) -> parse text blocks. One retry on failure."""
     if not (_key() and image_bytes):
         return {**cached, "mode": SIM}
     # doc-ai authenticates with api-subscription-key only; an extra Bearer header is rejected with 401.
     h = {"api-subscription-key": _key()}
-    base = DOC_AI.rsplit("/", 1)[0]
-    try:
-        mime = "image/jpeg" if filename.lower().endswith((".jpg", ".jpeg")) else "image/png"
-        r = httpx.post(DOC_AI, headers=h, timeout=30, files={"file": (filename, image_bytes, mime)}, data={"language": "en-IN"})
-        r.raise_for_status()
-        jid = r.json()["job_id"]
-        deadline = time.monotonic() + 40
-        while time.monotonic() < deadline:
-            st = httpx.get(f"{base}/{jid}/status", headers=h, timeout=15).json().get("status")
-            if st in ("completed", "partially_completed"):
-                break
-            if st in ("failed", "rejected"):
-                raise RuntimeError(f"doc-ai job {st}")
+    err = ""
+    for attempt in range(2):
+        try:
+            text = _doc_ai_once(image_bytes, filename, h)
+            return {**parse_receipt_text(text), "embedded_text": text[:1500], "mode": LIVE}
+        except Exception as e:
+            err = str(e)[:120]
             time.sleep(1.0)
-        else:
-            raise TimeoutError("doc-ai job did not finish in 40s")
-        res = httpx.get(f"{base}/{jid}/results", headers=h, params={"format": "json"}, timeout=30)
-        res.raise_for_status()
-        blocks = [b["text"] for d in res.json().get("documents", []) for p in d.get("pages", []) for b in p.get("blocks", []) if b.get("text")]
-        text = "\n".join(blocks)
-        return {**parse_receipt_text(text), "embedded_text": text[:600], "mode": LIVE}
-    except Exception as e:
-        return {**cached, "mode": SIM, "error": str(e)[:120]}
+    return {**cached, "mode": SIM, "error": err}
 
 
 def chat(messages: list[dict], model: str = "sarvam-105b", temperature: float = 0.1, max_tokens: int = 1000) -> dict:
