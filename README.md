@@ -28,6 +28,14 @@ deterministic local squad (`DETERMINISTIC_FALLBACK`), voice input uses the brows
 receipt is spoken by the browser. With it, the squad, STT and TTS run live on Sarvam. Live screenshot OCR additionally needs `SARVAM_OCR_URL`;
 without it, screenshots are stored as untrusted evidence and never used for amounts.
 
+## Deploy (Render, one service)
+The `Dockerfile` builds the React app and serves it from FastAPI, so the API and UI share one URL; `render.yaml` describes the service.
+1. In Render: **New → Blueprint**, pick this repo. It reads `render.yaml`.
+2. Set `SARVAM_API_KEY` when prompted (the HMAC secrets are generated for you). Without it VAADA runs its deterministic fallbacks.
+3. Deploy. The app is at `https://<service>.onrender.com`; health check `/api/status`.
+
+The sandbox re-seeds on every start (free instances also sleep when idle), so cases don't persist across restarts.
+
 ## How to use it
 The screen has three parts. **Customer phone** (left), **Ops console** (centre) and **Ops Copilot** (right, or the floating button on smaller screens).
 
@@ -44,12 +52,32 @@ The screen has three parts. **Customer phone** (left), **Ops console** (centre) 
 4. Copilot: *"bank settles this refund"* → the verifier checks the bank-signed UTR → **Verified closed**, and Riya gets a Hindi voice receipt (Sarvam Bulbul).
 5. Other customers: **Kabir** (prompt injection → contained before any LLM), **Aman** ₹350 (fast path, 0 LLM calls; ask about his ₹120 payment → "no refund due"), **Neha** (voice note → refund; then *"simulate duplicate retry"* → blocked by the idempotency lock).
 
+### Claim verification (refunds owed after a *successful* payment)
+Not every refund is a failed payment. A train gets cancelled, food never arrives, a recharge fails at the operator: the
+payment succeeded, and the refund depends on what the merchant did afterwards. VAADA splits every claim into facts and checks each
+against an independent record: **payment** (bank ledger), **order ownership** (merchant record: the order's payment reference must be
+this customer's payment), **what happened** (merchant status + who cancelled), **what's owed** (category refund policy in
+`config.MERCHANT_REFUND_RULES`), **already paid?** (merchant refunds, open chargebacks), plus screenshot (low trust) and claim history.
+Only records can make a claim pass. The customer's words can only make it fail.
+
+* Merchants plug in through connectors (`backend/merchant_rails.py`): each maps its own raw format (PNR, order ID, recharge ID) to one
+  `MerchantOrder` shape. Sandbox connectors: RailBook (travel), FoodNow (food), QuickRecharge (recharge), ShopKart (e-commerce).
+* No connector? VAADA confirms the payment, raises a dispute and promises the merchant's answer, never money.
+* Merchant-funded refunds don't touch the agent wallet; they close only on a bank-signed UTR linked to the original payment for exactly
+  the amount the policy owes.
+
+Try it: **Arjun** (train cancelled with PNR, food undelivered with a refund already in flight, failed recharge) and **Vikram**
+(quotes Arjun's PNR → contradicted and Arjun's case is alerted; asks for a full refund on a ticket he cancelled and was already refunded
+for → refused with the UTR; claims non-delivery on a delivered order with a chargeback open → contradicted). **Aman**: "Chai Point ka
+order cancel ho gaya" → no connector → dispute raised. Ask the Copilot *"Show evidence"* on any case.
+
 ### Sarvam models used
 `sarvam-105b` for chat/CrewAI, sent with `reasoning_effort: null` (it's a reasoning model; with thinking on, replies took 20 s+ and empty answers made CrewAI loop). `saaras:v3` in `translit` mode for STT, so voice arrives as Roman Hinglish; spoken amounts like *"teen sau pachaas"* are parsed to 350. `bulbul:v3` for TTS. Older `sarvam-m` / `bulbul:v2` are deprecated by Sarvam.
 
 ## What is measured vs. what is a policy constant
 * Measured at runtime: τ*_issue / τ*_action, confidences, latencies, F1, ECE, Brier, coverage, false-auto-approval, cost curves.
-* Policy constants (`backend/config.py`): cost matrix (4 vs 1), ₹500/₹5,000 wallet, 12 h approver SLA, 24 h update window, RBI T+1/T+5 and ₹100/day.
+* Policy constants (`backend/config.py`): cost matrix (4 vs 1), ₹500/₹5,000 wallet, 12 h approver SLA, 24 h update window, RBI T+1/T+5 and ₹100/day,
+  merchant refund rules per category (sandbox merchant policies), claim-history review threshold (3).
 * Data is `SYNTHETIC_DEMO_DATA`. OOD split = unseen templates, typo/slang perturbations, unseen injection payloads. A separate 200-case
   in-distribution test set exists only to report the ID→OOD gap (the 900-case core split is 500/200/200 as specified).
 

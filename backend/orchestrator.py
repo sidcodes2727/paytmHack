@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import breach_radar
+import claim_verifier
 import clock
 import config
 import data_and_nirnay as dn
 import ledger_db
+import merchant_rails
 import mock_ledger
 import policy_gate
 import sarvam_adapter
@@ -79,6 +81,8 @@ def _refresh(case: dict) -> dict:
 
 # ------------------------------------------------------------------ customer-facing copy
 def status_text(case: dict) -> str:
+    if case.get("kind") == "MERCHANT_REFUND":
+        return merchant_text(case)
     amt = inr(case["verified"]["verified_amount"])
     p = case.get("promise")
     when = fmt_when(p["draft"]["by_when"]) if p else None
@@ -103,6 +107,8 @@ def status_text(case: dict) -> str:
 
 
 def _ack(case: dict) -> str:
+    if case.get("kind") == "MERCHANT_REFUND":
+        return merchant_text(case, ack=True)
     amt = inr(case["verified"]["verified_amount"])
     who = case["counterparty"].split(" (")[0]
     out, gate = case.get("outcome"), case.get("gate") or {}
@@ -115,6 +121,9 @@ def _ack(case: dict) -> str:
                 f"par successfully credit ho chuka hai. Isliye refund due nahi hai. Kuch aur madad chahiye to batayein.")
     if "SCREENSHOT_LEDGER_MISMATCH" in codes:
         m = case["claim_vs_fact"]["mismatches"][0]
+        if m["field"] == "payment_ref":
+            return ("Aapne jo payment reference bataya wo kisi doosre account ke payment ka hai, aapke account ka nahi. "
+                    "Isliye is par refund process nahi ho sakta. Case specialist review me bheja gaya hai.")
         return (f"Aapne jo amount bataya (₹{m['claimed']:,.0f}) wo bank records ({inr(m['ledger'])}) se match nahi karta. "
                 f"Case specialist review me bheja gaya hai; 24 ghante me update denge.")
     p = case["promise"]["draft"]
@@ -141,7 +150,90 @@ def _hinglish_root(case: dict) -> str:
     return ""
 
 
+STATUS_HI = {"CANCELLED": "cancel ho chuka hai", "NOT_DELIVERED": "deliver nahi hua", "FAILED_FULFILMENT": "fail hua",
+             "RETURNED": "return mil chuka hai", "FULFILLED": "poora ho chuka hai", "PENDING": "abhi process me hai"}
+BY_HI = {"MERCHANT": "merchant ki taraf se", "CUSTOMER": "aapki taraf se", "SYSTEM": "system ki taraf se"}
+
+
+def merchant_text(case: dict, ack: bool = False) -> str:
+    """Customer-facing copy for refunds owed after a successful payment. Every fact quoted comes from the records."""
+    ev = case["evidence"]
+    o = ev.get("order") or {}
+    amt = inr(case["verified"]["verified_amount"])
+    who = o.get("merchant_name") or case["counterparty"].split(" (")[0]
+    ref = f"{o.get('order_label')} {o.get('order_ref')}" if o else ""
+    st = f"{STATUS_HI.get(o.get('status'), '')}" + (f" ({BY_HI[o['cancelled_by']]})" if o.get("cancelled_by") else "")
+    out, p = case.get("outcome"), (case.get("promise") or {}).get("draft")
+    fail = next((c for c in ev["checks"] if c["status"] == "FAIL" and c["code"] in claim_verifier.CONTRADICTING_CODES), None)
+    if out == "CONTAINED":
+        return "Ye request security review me hai. Records se verify hue bina koi payout nahi hoga."
+    if out == "CLAIM_CONTRADICTED":
+        if fail and fail["code"] == "FOREIGN_ORDER_CLAIMED":
+            return (f"Aapne jo {fail['label'].replace('Quoted ', '')} bataya, wo booking aapke account se pay nahi hui hai. "
+                    f"Isliye is par refund process nahi ho sakta. Agar booking aapki hai, to jis account se payment hua tha "
+                    f"wahan se request karein.")
+        if fail and fail["code"] == "CLAIM_CONTRADICTS_MERCHANT_RECORD":
+            return (f"{who} ke record ke hisaab se aapka {ref} {st}. Isliye refund due nahi dikh raha. "
+                    f"Agar aapke paas aur jaankari hai to bhejiye; case specialist review me hai.")
+        return "Aapki di hui details hamare bank aur merchant records se match nahi karti. Case specialist review me hai."
+    if out == "DISPUTE_RAISED":
+        d = case["dispute"]
+        return (f"Maine verify kiya: {amt} ka payment {who} ko hua tha. Is merchant ke order records hamare paas direct nahi "
+                f"hain, isliye main refund ka vaada nahi kar sakta. Maine merchant ke saath dispute {d['ref']} raise kiya hai; "
+                f"unka jawab {fmt_when(d['respond_by'])} tak aapko bataunga.")
+    if out == "NO_REFUND_DUE":
+        return f"{who} ke record ke hisaab se aapka {ref} {st}, isliye policy ke under refund due nahi hai."
+    if out == "ALREADY_REFUNDED":
+        r = next(r for r in o["refunds"] if r["status"] == "CREDITED")
+        charge = o["amount"] - ev["amount_due"]
+        return (f"Aapka {ref} {st}. Policy ke hisaab se {inr(ev['amount_due'])} refund banta tha"
+                + (f" ({inr(charge)} cancellation charge)" if charge > 0 else "")
+                + f", jo {fmt_when(r['credited_at'])} ko aapke account me credit ho chuka hai (UTR {r['utr']}). "
+                  f"Isliye aur refund due nahi hai.")
+    if out in ("MANUAL_REVIEW", "REJECTED"):
+        extra = " Is payment par aapke bank me pehle se chargeback chal raha hai, do jagah se refund nahi ho sakta." \
+            if "CHARGEBACK_OPEN" in ev["codes"] else ""
+        return f"Aapka case manual review me hai.{extra} Ek specialist 24 ghante me update dega."
+    due = inr(case.get("expected_refund") or ev.get("amount_remaining") or 0)
+    by = fmt_when(p["by_when"]) if p else "24 ghante"
+    partial = f" (cancellation charges ke baad)" if ev["verdict"] == "PARTIAL" else ""
+    if case["state"] == "VERIFIED_CLOSED":
+        utr = (case.get("verification") or {}).get("receipt", {}).get("utr", "")
+        return f"Ye case close ho chuka hai: {due} aapke account me credit ho gaya (UTR {utr})."
+    if case["state"] == "AWAITING_PROOF":
+        if ev["verdict"] == "IN_FLIGHT":
+            return (f"Maine check kiya: {who} ke record me aapka {ref} {st}, aur unhone {due} ka refund pehle hi shuru kar "
+                    f"diya hai. Main ise track kar raha hoon. Humara vaada: paisa {by} tak aapke account me. "
+                    f"Credit confirm hone tak case open rahega.")
+        lead = (f"Maine verify kar liya: {who} ke record me aapka {ref} {st}, aur {due} refund banta hai{partial}. " if ack
+                else f"{due} ka refund {who} se request ho chuka hai. ")
+        return lead + f"Refund request merchant ko bhej di hai. Humara vaada: paisa {by} tak aapke account me. Credit confirm hone tak case open rahega."
+    if case["state"] == "AWAITING_APPROVAL":
+        return (f"Maine verify kar liya: aapka {ref} {st}, {due} refund banta hai{partial}. Refund request finance team ke "
+                f"review ke baad merchant ko jayegi. Agla update {by} tak pakka.")
+    return f"Aapka {amt} wala case review me hai. Agla update {by} tak."
+
+
 def triage_summary(case: dict) -> dict:
+    if case.get("kind") == "MERCHANT_REFUND" and case.get("outcome") != "CONTAINED":
+        ev = case["evidence"]
+        fail = next((c for c in ev["checks"] if c["status"] == "FAIL"), None)
+        return {
+            "VERIFIED": {"label": "Verified by records", "tone": "green",
+                         "text": "Payment, order ownership and status confirmed against bank and merchant systems."},
+            "PARTIAL": {"label": "Partly refundable", "tone": "green",
+                        "text": "Records confirm the claim; the merchant's policy refunds part of the payment."},
+            "IN_FLIGHT": {"label": "Merchant already refunding", "tone": "green",
+                          "text": "Records confirm the claim and the merchant has already started the refund; VAADA tracks it."},
+            "CONTRADICTED": {"label": "Claim contradicted", "tone": "red",
+                             "text": fail["detail"] if fail else "Claim conflicts with the records."},
+            "UNVERIFIABLE": {"label": "Can't verify yet", "tone": "amber",
+                             "text": "No merchant connector: payment confirmed, refund entitlement unknown. Dispute raised, no money promised."},
+            "NOT_DUE": {"label": "No refund due", "tone": "slate", "text": fail["detail"] if fail else "Merchant record shows nothing owed."},
+            "ALREADY_REFUNDED": {"label": "Already refunded", "tone": "slate",
+                                 "text": "The merchant already credited everything that was owed."},
+            "NEEDS_REVIEW": {"label": "Manual review", "tone": "amber", "text": "A chargeback is open on the same payment."},
+        }[ev["verdict"]]
     n = case["nirnay"]
     if case.get("outcome") == "CONTAINED":
         return {"label": "Contained", "tone": "red", "text": "Prompt-injection attempt detected in customer input. Never reached an LLM."}
@@ -157,19 +249,72 @@ def triage_summary(case: dict) -> dict:
     return {"label": "Specialist review", "tone": "amber", "text": f"Escalated to the specialist squad because {why}."}
 
 
+# ------------------------------------------------------------------ evidence helpers
+def _history(customer_id: str, row: dict, exclude: str | None = None) -> dict:
+    contradicted = 0
+    for t in ledger_db.list_case_ids():
+        c = ledger_db.load_case(t)
+        if c and t != exclude and c["customer"]["id"] == customer_id and (c.get("evidence") or {}).get("verdict") == "CONTRADICTED":
+            contradicted += 1
+    return {"bank_disputes": row["dispute_history_count"], "contradicted_claims": contradicted}
+
+
+def _other_claimants(refs: list[str], customer_id: str) -> list[str]:
+    """Other accounts whose cases point at the same order (as their own order or as a quoted reference)."""
+    out = set()
+    for t in ledger_db.list_case_ids():
+        c = ledger_db.load_case(t)
+        if not c or c["customer"]["id"] == customer_id:
+            continue
+        theirs = set(c["claimed"].get("refs") or [])
+        o = (c.get("evidence") or {}).get("order")
+        if o:
+            theirs.add(o["order_ref"])
+        if theirs & set(refs):
+            out.add(c["customer"]["id"])
+    return sorted(out)
+
+
+def _merchant_evidence(case: dict) -> dict:
+    """Re-read the bank and merchant systems and re-verify. Always fresh: never trusts an earlier verdict."""
+    row = bank.get(case["txn_id"])
+    order = merchant_rails.order_for_payment(case["txn_id"])
+    claim = ClaimedContext(**{k: v for k, v in case["claimed"].items() if k != "untrusted"})
+    return claim_verifier.evaluate_merchant(case["customer"]["id"], row, order, claim,
+                                            _history(case["customer"]["id"], row, exclude=case["txn_id"]),
+                                            _other_claimants([order.order_ref], case["customer"]["id"]) if order else [])
+
+
+def _is_merchant_claim(v, claim: ClaimedContext, txn_id: str) -> bool:
+    """Payment succeeded at a merchant, and either we can see the order or the customer says something went wrong
+    after paying (cancelled / not delivered / returned / recharge failed) or quotes an order reference."""
+    if v.failure_stage != "NONE" or v.tx_type != "P2M":
+        return False
+    return (merchant_rails.order_for_payment(txn_id) is not None or claim_verifier.claimed_reason(claim.combined_text) is not None
+            or any(not claim_verifier.RRN_RE.fullmatch(r) for r in claim.refs))
+
+
 # ------------------------------------------------------------------ pipeline
 def open_case(customer_id: str, txn_id: str, text: str, *, voice_transcript: str = "", voice_mode: str | None = None,
-              ocr: dict | None = None, attachment: dict | None = None) -> dict:
+              ocr: dict | None = None, attachment: dict | None = None, refs: list[str] | None = None) -> dict:
     model: dn.Nirnay = STATE["model"]
     row = bank.get(txn_id)
     v = verified_from_row(row)
     now = clock.now()
 
     claim = ClaimedContext(raw_text=text, voice_transcript=voice_transcript, voice_mode=voice_mode,
-                           ocr=OcrClaim(**ocr) if ocr else None)
+                           ocr=OcrClaim(**ocr) if ocr else None, refs=refs or [])
     scan = scan_for_injection(claim)
     cvf = claim_vs_fact(claim, v)
     disc = multi_system_discrepancy(v)
+    merchant_claim = not scan["adversarial"] and _is_merchant_claim(v, claim, txn_id)
+    evidence = None
+    if not merchant_claim:
+        evidence = claim_verifier.evaluate_payment_failure(customer_id, row, claim, cvf, disc,
+                                                           _history(customer_id, row, exclude=txn_id))
+        if "FOREIGN_PAYMENT_CLAIMED" in evidence["codes"] and not cvf["claim_ledger_mismatch"]:
+            cvf["mismatches"].append({"field": "payment_ref", "claimed": "another account's payment", "ledger": txn_id})
+            cvf.update(claim_ledger_mismatch=True, code="SCREENSHOT_LEDGER_MISMATCH")
     hours = (now - datetime.fromisoformat(v.txn_timestamp)).total_seconds() / 3600
     feats = {"verified_amount": v.verified_amount, "hours_elapsed": hours, "tx_type": v.tx_type,
              "gateway_status": v.gateway_status, "bank_webhook_received": v.bank_webhook_received,
@@ -182,6 +327,7 @@ def open_case(customer_id: str, txn_id: str, text: str, *, voice_transcript: str
             "counterparty": row.get("counterparty") or "", "claimed": claim.model_dump(), "attachments": [attachment] if attachment else [],
             "verified": v.model_dump(), "features": feats, "injection": scan, "claim_vs_fact": cvf, "discrepancy": disc,
             "nirnay": decision, "crew": None, "promise": None, "gate": None, "approval": None, "execution": None,
+            "kind": "MERCHANT_REFUND" if merchant_claim else "PAYMENT_FAILURE", "evidence": evidence,
             "events": [], "identity_trail": [{"role": "role:nirnay_triage", "capability": "classify", "ok": True}]}
     ledger_db.append_chain(txn_id, "OPEN_TRIAGED", "OPEN_TRIAGED", {
         "customer_text": claim.combined_text[:280], "nirnay_route": decision["overall_route"],
@@ -193,6 +339,11 @@ def open_case(customer_id: str, txn_id: str, text: str, *, voice_transcript: str
         case["gate"] = policy_gate.evaluate_action(txn_id, "execute_refund", EXEC_TOKEN, adversarial=True,
                                                    claim_ledger_mismatch=cvf["claim_ledger_mismatch"])
         _event(case, "ADVERSARIAL_INPUT_CONTAINED", {"patterns": scan["patterns"], "gate": case["gate"]["reason_codes"]})
+    elif merchant_claim:
+        case["evidence"] = ev = _merchant_evidence(case)
+        _event(case, "CLAIM_VERIFIED", {"verdict": ev["verdict"], "codes": ev["codes"], "amount_due": ev.get("amount_due"),
+                                        "sources": sorted({c["source"] for c in ev["checks"]})})
+        _merchant_decide(case)
     elif v.failure_stage == "NONE" and not cvf["claim_ledger_mismatch"]:
         case["outcome"] = "NO_REFUND_DUE"
         case["gate"] = policy_gate.evaluate_action(txn_id, "execute_refund", EXEC_TOKEN)
@@ -250,6 +401,97 @@ def _promise_and_gate(case: dict, crew: dict | None) -> None:
     run_gate(case)
 
 
+def _merchant_decide(case: dict) -> None:
+    ev, now = case["evidence"], clock.now()
+    verdict = ev["verdict"]
+    block = lambda codes: {"decision": policy_gate.BLOCK, "reason_codes": codes, "amount": ev.get("amount_remaining")}
+    if verdict == "CONTRADICTED":
+        case["outcome"] = "CLAIM_CONTRADICTED"
+        case["gate"] = block([c for c in ev["codes"] if c in claim_verifier.CONTRADICTING_CODES])
+        _event(case, "POLICY_BLOCK", {"reason_codes": case["gate"]["reason_codes"]})
+        _alert_order_owners(case)
+    elif verdict == "UNVERIFIABLE":
+        case["outcome"] = "DISPUTE_RAISED"
+        case["dispute"] = {"ref": "DSP" + security.sha256_hex(case["txn_id"] + now.isoformat())[:10].upper(),
+                           "raised_at": now.isoformat(), "with": case["counterparty"],
+                           "respond_by": (now + timedelta(hours=config.MERCHANT_DISPUTE_SLA_HOURS)).isoformat()}
+        _event(case, "MERCHANT_DISPUTE_RAISED", case["dispute"])
+    elif verdict == "NOT_DUE":
+        case["outcome"] = "NO_REFUND_DUE"
+        case["gate"] = block(["NO_REFUND_DUE_UNDER_POLICY"])
+        _event(case, "MERCHANT_RECORD_NO_REFUND_DUE", {"status": ev["order"]["status"], "codes": ev["codes"]})
+    elif verdict == "ALREADY_REFUNDED":
+        case["outcome"] = "ALREADY_REFUNDED"
+        case["gate"] = block(["ALREADY_REFUNDED"])
+        r = next(r for r in ev["order"]["refunds"] if r["status"] == "CREDITED")
+        _event(case, "ALREADY_REFUNDED", {"amount": ev["amount_credited"], "utr": r["utr"], "credited_at": r["credited_at"]})
+    elif verdict == "NEEDS_REVIEW":
+        case["outcome"] = "MANUAL_REVIEW"
+        case["gate"] = block(["CHARGEBACK_OPEN"])
+        _event(case, "POLICY_BLOCK", {"reason_codes": ["CHARGEBACK_OPEN"]})
+    else:
+        o = ev["order"]
+        amount = ev["amount_pending"] if verdict == "IN_FLIGHT" else ev["amount_remaining"]
+        by_when = max(datetime.fromisoformat(ev["deadline_iso"]), now + timedelta(hours=config.CUSTOMER_UPDATE_WINDOW_HOURS))
+        draft = {"what": f"{inr(amount)} refund from {o['merchant_name']} for {o['order_label']} {o['order_ref']}, "
+                         f"credited to the original payment source",
+                 "by_when": by_when.isoformat(), "who": f"{o['merchant_name']} (pays) · VAADA chases it to completion",
+                 "proof_check_id": "MERCHANT_REFUND_UTR_CREDITED", "narrower_controllable_commitment": None,
+                 "basis": f"{ev['category_label']} policy: {ev['sla_days']} days from {o['status'].lower().replace('_', ' ')}"}
+        case["expected_refund"] = amount
+        case["promise"] = {"draft": draft, "head3": None, "created_at": now.isoformat()}
+        _transition(case, "PROMISE_ACTIVE", "PROMISE_COMPILED", {"what": draft["what"], "by_when": draft["by_when"],
+                    "proof_check_id": draft["proof_check_id"]})
+        if verdict == "IN_FLIGHT":
+            r = next(r for r in o["refunds"] if r["status"] == "PENDING")
+            case["execution"] = {"refund_api": {"refund_ref": r["refund_ref"], "status_code": None}, "amount": amount,
+                                 "executed_at": None, "by": "merchant (already in flight)"}
+            _transition(case, "AWAITING_PROOF", "MERCHANT_REFUND_IN_FLIGHT", {"refund_ref": r["refund_ref"], "amount": amount,
+                        "proof_check_id": draft["proof_check_id"]})
+        else:
+            run_merchant_gate(case)
+
+
+def _alert_order_owners(case: dict) -> None:
+    """Someone quoted another account's booking: record it on the real owner's case (if they have one)."""
+    for ref in case["claimed"].get("refs") or []:
+        o = merchant_rails.order_by_ref(ref)
+        if not o or o.customer_ref == case["customer"]["id"]:
+            continue
+        owner = ledger_db.load_case(o.payment_txn_id)
+        if owner:
+            _event(owner, "ORDER_CLAIMED_BY_OTHER_ACCOUNT", {"order_ref": ref, "claimed_in_case": case["txn_id"],
+                                                             "action": "flagged to security; owner's refund unaffected"})
+            ledger_db.save_case(owner)
+
+
+def run_merchant_gate(case: dict, human_approval: dict | None = None) -> dict:
+    case["evidence"] = ev = _merchant_evidence(case)          # fresh records at decision time
+    res = policy_gate.execute_merchant_refund(case["txn_id"], ev["order"]["order_ref"], EXEC_TOKEN, ev,
+                                              human_approval=human_approval, adversarial=case["injection"]["adversarial"])
+    case["gate"] = {k: v for k, v in res.items() if k != "refund_api"}
+    case["identity_trail"].append({"role": "role:scoped_executor", "capability": "request_merchant_refund", "ok": True})
+    if res.get("executed"):
+        case["expected_refund"] = res["amount"]
+        case["execution"] = {"refund_api": res["refund_api"], "idempotency_key": res["idempotency_key"], "amount": res["amount"],
+                             "executed_at": clock.now().isoformat(), "by": "human_approval" if human_approval else "autonomous"}
+        _transition(case, "ACTION_EXECUTED", "MERCHANT_REFUND_REQUESTED_202", {"refund_ref": res["refund_api"]["refund_ref"],
+                    "amount": res["amount"], "idempotency_key": res["idempotency_key"]})
+        _transition(case, "AWAITING_PROOF", "AWAITING_REFUND_CREDIT", {"proof_check_id": "MERCHANT_REFUND_UTR_CREDITED"})
+    elif res["decision"] == policy_gate.HOLD and not case.get("approval"):
+        req = policy_gate.issue_approval_request(case["txn_id"], "request_merchant_refund", res["amount"], config.PRIMARY_APPROVER)
+        o = ev["order"]
+        brief = (f"Ask {o['merchant_name']} to refund {inr(res['amount'])} for {o['order_label']} {o['order_ref']}. "
+                 f"Records verified ({ev['verdict'].lower()}); held because: {', '.join(res['reason_codes'])}.")
+        case["approval"] = {"status": "PENDING", "assigned_to": config.PRIMARY_APPROVER, "requested_at": clock.now().isoformat(),
+                            "escalated": False, "authority_log": [], "request": req, "brief": brief, "reason_codes": res["reason_codes"]}
+        _transition(case, "AWAITING_APPROVAL", "POLICY_HOLD", {"reason_codes": res["reason_codes"],
+                    "approval_token_prefix": req["token"][:16], "assigned_to": config.PRIMARY_APPROVER})
+    elif res["decision"] == policy_gate.BLOCK:
+        _event(case, "POLICY_BLOCK", {"reason_codes": res["reason_codes"]})
+    return res
+
+
 def _finish_slow_path(txn_id: str) -> None:
     """Background: run the live CrewAI squad (bounded by CREW_TIMEOUT_S), then continue the pipeline."""
     with LOCK:
@@ -274,12 +516,19 @@ def _finish_slow_path(txn_id: str) -> None:
         _notify_case(case, _ack(case), "ack")
 
 
+def _risk_review(case: dict) -> bool:
+    return bool(((case.get("evidence") or {}).get("risk") or {}).get("review_required"))
+
+
 def run_gate(case: dict, human_approval: dict | None = None) -> dict:
+    if case.get("kind") == "MERCHANT_REFUND":
+        return run_merchant_gate(case, human_approval)
     txn, d = case["txn_id"], case["nirnay"]
     res = policy_gate.execute_action(txn, "execute_refund", EXEC_TOKEN, human_approval=human_approval,
                                      nirnay_route=d["overall_route"], nirnay_action=d["action_pred"],
                                      adversarial=case["injection"]["adversarial"],
-                                     claim_ledger_mismatch=case["claim_vs_fact"]["claim_ledger_mismatch"])
+                                     claim_ledger_mismatch=case["claim_vs_fact"]["claim_ledger_mismatch"],
+                                     risk_review=_risk_review(case))
     case["gate"] = {k: v for k, v in res.items() if k != "refund_api"}
     case["identity_trail"].append({"role": "role:scoped_executor", "capability": "execute_refund", "ok": True})
     if res.get("executed"):
@@ -303,17 +552,26 @@ def run_gate(case: dict, human_approval: dict | None = None) -> dict:
 
 # ------------------------------------------------------------------ queries
 def _group(c: dict) -> str:
-    if c.get("outcome") == "CONTAINED":
+    if c.get("outcome") in ("CONTAINED", "CLAIM_CONTRADICTED"):
         return "blocked"
-    if c.get("outcome") in ("NO_REFUND_DUE",) or c["state"] == "VERIFIED_CLOSED":
+    if c.get("outcome") in ("NO_REFUND_DUE", "ALREADY_REFUNDED") or c["state"] == "VERIFIED_CLOSED":
         return "closed"
-    if c.get("outcome") == "REJECTED":
+    if c.get("outcome") in ("REJECTED", "DISPUTE_RAISED", "MANUAL_REVIEW"):
         return "manual_review"
     if c["state"] == "AWAITING_APPROVAL":
         return "approval"
     if (c.get("gate") or {}).get("decision") == "BLOCK":
         return "manual_review"
     return "in_progress"
+
+
+def _verify(case: dict) -> dict | None:
+    if case.get("kind") != "MERCHANT_REFUND":
+        return verifier.verify(case["txn_id"], AUDIT_TOKEN)
+    o = (case.get("evidence") or {}).get("order")
+    if not o or not case.get("expected_refund"):
+        return None
+    return verifier.verify_merchant_refund(o["order_ref"], case["txn_id"], case["expected_refund"], AUDIT_TOKEN)
 
 
 def view_case(txn: str) -> dict | None:
@@ -323,7 +581,7 @@ def view_case(txn: str) -> dict | None:
             return None
         _refresh(case)
         if case["state"] != "VERIFIED_CLOSED":
-            case["verification"] = verifier.verify(txn, AUDIT_TOKEN)
+            case["verification"] = _verify(case)
         ledger_db.save_case(case)
         case["group"] = _group(case)
         case["chain"] = ledger_db.get_chain(txn)
@@ -349,7 +607,7 @@ def case_summaries() -> list[dict]:
                     "outcome": c.get("outcome"), "group": c["group"], "risk": c["breach"]["risk_score"],
                     "triage": c["triage"], "assigned_to": (c.get("approval") or {}).get("assigned_to"),
                     "by_when": p["draft"]["by_when"] if p else None, "created_at": c["created_at"],
-                    "rbi_breached": c["rbi"]["is_tat_breached"],
+                    "rbi_breached": c["sla"]["is_breached"], "kind": c.get("kind"),
                     "crew_running": (c.get("crew") or {}).get("mode") == "RUNNING"})
     return res
 
@@ -386,8 +644,12 @@ def approve(txn: str, role: str) -> dict:
         ap.update(status="APPROVED", decided_by=role, decided_at=clock.now().isoformat())
         _refresh(case)
         ledger_db.save_case(case)
-        _notify_case(case, f"Approval mil gaya! {inr(case['verified']['verified_amount'])} ka refund bank ko bhej diya gaya hai. "
-                           f"Bank se UTR confirm hote hi main aapko bataunga.", "update")
+        if case.get("kind") == "MERCHANT_REFUND":
+            _notify_case(case, f"Approval mil gaya! {inr(case['expected_refund'])} ki refund request merchant ko bhej di gayi hai. "
+                               f"Credit (UTR) confirm hote hi main aapko bataunga.", "update")
+        else:
+            _notify_case(case, f"Approval mil gaya! {inr(case['verified']['verified_amount'])} ka refund bank ko bhej diya gaya hai. "
+                               f"Bank se UTR confirm hote hi main aapko bataunga.", "update")
         return case
 
 
@@ -411,14 +673,22 @@ def reject(txn: str, role: str) -> dict:
 def bank_settles(txn: str) -> dict:
     with LOCK:
         case = _load(txn)
-        wh = bank.bank_webhook_settle(txn)
+        merchant = case.get("kind") == "MERCHANT_REFUND"
+        if merchant:
+            if case["state"] != "AWAITING_PROOF":
+                raise ActionError("No merchant refund is pending for this case yet.")
+            wh = merchant_rails.settle_refund(case["evidence"]["order"]["order_ref"])
+        else:
+            wh = bank.bank_webhook_settle(txn)
         if not wh["ok"]:
             raise ActionError("The bank has no pending refund for this case yet (it must be approved/executed first).")
-        _event(case, "BANK_WEBHOOK_RECEIVED", {"utr": wh["receipt"]["utr"], "status": "CREDITED"})
-        ver = verifier.verify(txn, AUDIT_TOKEN)
+        _event(case, "BANK_WEBHOOK_RECEIVED", {"utr": wh["receipt"]["utr"], "status": "CREDITED",
+                                               "source": "merchant refund" if merchant else "bank refund"})
+        ver = _verify(case)
         if ver["closable"]:
             _transition(case, "VERIFIED_CLOSED", "PROOF_VERIFIED", {"utr": ver["receipt"]["utr"], "checks": ver["checks"]})
-            text = (f"Aapka {inr(case['verified']['verified_amount'])} ka refund bank account me credit ho gaya hai. "
+            amt = case.get("expected_refund") or case["verified"]["verified_amount"]
+            text = (f"Aapka {inr(amt)} ka refund bank account me credit ho gaya hai. "
                     f"UTR {ver['receipt']['utr']}. VAADA par bharosa karne ke liye dhanyavaad!")
             tts = sarvam_adapter.text_to_speech(text)
             case["verification"] = {**ver, "voice": {k: v for k, v in tts.items() if k != "audio_b64"}}
@@ -435,9 +705,18 @@ def duplicate_retry(txn: str) -> dict:
     with LOCK:
         case = _load(txn)
         d = case["nirnay"]
-        res = policy_gate.execute_action(txn, "execute_refund", EXEC_TOKEN, nirnay_route=d["overall_route"],
-                                         nirnay_action=d["action_pred"], adversarial=case["injection"]["adversarial"],
-                                         claim_ledger_mismatch=case["claim_vs_fact"]["claim_ledger_mismatch"])
+        if case.get("kind") == "MERCHANT_REFUND":
+            ev = case["evidence"]
+            if not ev.get("order"):
+                raise ActionError("This case has no merchant order to refund.")
+            # replay of the *same* request (stored evidence): only the idempotency lock stands in the way
+            res = policy_gate.execute_merchant_refund(txn, ev["order"]["order_ref"], EXEC_TOKEN, ev,
+                                                      adversarial=case["injection"]["adversarial"])
+        else:
+            res = policy_gate.execute_action(txn, "execute_refund", EXEC_TOKEN, nirnay_route=d["overall_route"],
+                                             nirnay_action=d["action_pred"], adversarial=case["injection"]["adversarial"],
+                                             claim_ledger_mismatch=case["claim_vs_fact"]["claim_ledger_mismatch"],
+                                             risk_review=_risk_review(case))
         res = {k: v for k, v in res.items() if k != "refund_api"}
         case.setdefault("retries", []).append({"at": clock.now().isoformat(), **res})
         _event(case, "DUPLICATE_RETRY_ATTEMPT", {"reason_codes": res["reason_codes"], "executed": res.get("executed", False),
@@ -465,6 +744,9 @@ def reset() -> None:
         bank.reset()
         for rec in scenarios.ledger_records():
             bank.seed(rec)
+        merchant_rails.reset()
+        for o in scenarios.merchant_orders():
+            merchant_rails.seed(o["merchant_id"], o["payment_txn_id"], o["raw"], refund=o["refund"], chargeback=o["chargeback"])
 
 
 def radar_tick() -> None:

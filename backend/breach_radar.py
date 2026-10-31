@@ -8,9 +8,10 @@ from policy_gate import evaluate_rbi_tat_compliance
 
 
 def hinglish_update(case: dict, rbi: dict) -> str:
-    amt = int(case["verified"]["verified_amount"])
-    return (f"Namaste! Aapke ₹{amt:,} wale case ({case['txn_id']}) par kaam jaari hai. Refund approval aur bank "
-            f"processing chal rahi hai; hum aapko agla update {int(CUSTOMER_UPDATE_WINDOW_HOURS)} ghante ke andar de denge. "
+    amt = int(case.get("expected_refund") or case["verified"]["verified_amount"])
+    step = "Merchant refund processing" if case.get("kind") == "MERCHANT_REFUND" else "Refund approval aur bank processing"
+    return (f"Namaste! Aapke ₹{amt:,} wale case ({case['txn_id']}) par kaam jaari hai. {step} "
+            f"chal rahi hai; hum aapko agla update {int(CUSTOMER_UPDATE_WINDOW_HOURS)} ghante ke andar de denge. "
             f"Settlement bank ke haath me hai, par hum har kadam track kar rahe hain. — VAADA")
 
 
@@ -18,7 +19,19 @@ def refresh(case: dict, append_event, notify=None) -> dict:
     """Recompute dynamic fields on a case. `append_event(case, name, data)` records hash-chained events."""
     now = clock.now()
     v = case["verified"]
-    rbi = evaluate_rbi_tat_compliance(v["tx_type"], v["failure_stage"], datetime.fromisoformat(v["txn_timestamp"]), now)
+    if case.get("kind") == "MERCHANT_REFUND":
+        # Payment succeeded, so RBI's failed-transaction TAT doesn't apply: the clock is the merchant's refund policy.
+        rbi = None
+        ev = case.get("evidence") or {}
+        o = ev.get("order") or {}
+        deadline_iso = ((case.get("promise") or {}).get("draft") or {}).get("by_when") or (case.get("dispute") or {}).get("respond_by")
+        start_iso = o.get("status_at") or case["created_at"]
+        source = (f"{o['merchant_name']} refund policy · {ev['category_label']} · {ev['sla_days']} days" if o
+                  else "Merchant dispute response window")
+    else:
+        rbi = evaluate_rbi_tat_compliance(v["tx_type"], v["failure_stage"], datetime.fromisoformat(v["txn_timestamp"]), now)
+        deadline_iso, start_iso = rbi["tat_deadline_iso"], v["txn_timestamp"]
+        source = f"RBI {rbi['tat_rule']} ({rbi['circular_ref'].split(' ')[0]})"
     case["rbi"] = rbi
     closed = case["state"] == "VERIFIED_CLOSED" or case.get("outcome") is not None
 
@@ -49,14 +62,19 @@ def refresh(case: dict, append_event, notify=None) -> dict:
         append_event(case, "PROACTIVE_CUSTOMER_UPDATE", {"remaining_fraction": round(remaining_frac, 3)})
 
     promise_progress = min(1.0, elapsed_h / window)
-    t0 = datetime.fromisoformat(v["txn_timestamp"])
-    span = (datetime.fromisoformat(rbi["tat_deadline_iso"]) - t0).total_seconds()
-    rbi_progress = min(1.0, max(0.0, (now - t0).total_seconds() / span))
+    rbi_progress = 0.0
+    if deadline_iso:
+        t0, dl = datetime.fromisoformat(start_iso), datetime.fromisoformat(deadline_iso)
+        span = max(1.0, (dl - t0).total_seconds())
+        rbi_progress = min(1.0, max(0.0, (now - t0).total_seconds() / span))
+    case["sla"] = {"source": source, "start_iso": start_iso, "deadline_iso": deadline_iso, "progress": rbi_progress,
+                   "is_breached": bool(deadline_iso) and now > datetime.fromisoformat(deadline_iso) and not closed,
+                   "hours_left": (datetime.fromisoformat(deadline_iso) - now).total_seconds() / 3600 if deadline_iso else None}
     overdue = 1.0 if (ap and ap["status"] == "PENDING" and ap.get("hours_waiting", 0) >= APPROVER_SLA_HOURS) else 0.0
     base = max(promise_progress, rbi_progress)
     score = 0 if closed else round(100 * min(1.0, base * (1 + 0.25 * overdue)))
     case["breach"] = {"risk_score": score, "promise_window_progress": promise_progress, "rbi_tat_progress": rbi_progress,
                       "approval_overdue": bool(overdue), "elapsed_hours": elapsed_h, "virtual_now": now.isoformat(),
                       "time_offset_hours": clock.offset_hours(),
-                      "formula": "100 * min(1, max(promise_window_progress, rbi_tat_progress) * (1 + 0.25*approval_overdue)); 0 when closed"}
+                      "formula": "100 * min(1, max(promise_window_progress, deadline_progress) * (1 + 0.25*approval_overdue)); 0 when closed"}
     return case

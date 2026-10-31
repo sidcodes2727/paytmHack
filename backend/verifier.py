@@ -37,3 +37,24 @@ def verify(txn_id: str, auditor_token: str) -> dict:
                        "settled_at": rec["settled_at"], "signature": rec["receipt_sig"]} if res["closable"] else None)
     res["verified_by"] = "role:independent_auditor"
     return res
+
+
+def verify_merchant_refund(order_ref: str, txn_id: str, expected_amount: float, auditor_token: str) -> dict:
+    """Merchant-funded refund: closes only on a bank-signed, settled UTR for this order, linked to this payment,
+    for the amount the merchant record says was owed."""
+    from merchant_rails import ReadOnlyMerchantLedger, receipt_body
+    rec = ReadOnlyMerchantLedger(auditor_token).get(order_ref)
+    if not rec:
+        return {"closable": False, "status": "BLOCKED: ORDER_NOT_FOUND", "checks": {}, "receipt": None}
+    body = receipt_body(rec)
+    checks = {
+        "utr_present_12_digits": bool(rec.get("refund_utr")) and bool(UTR_RE.match(str(rec["refund_utr"]))),
+        "status_credited": rec.get("refund_status") == "SETTLED",
+        "linked_to_original_payment": rec.get("payment_txn_id") == txn_id,
+        "amount_matches_entitlement": rec.get("refund_amount") is not None and abs(rec["refund_amount"] - expected_amount) < 0.5,
+        "bank_receipt_signature_valid": security.verify_bank_receipt(body, rec.get("refund_sig") or ""),
+    }
+    ok = all(checks.values())
+    return {"closable": ok, "checks": checks, "verified_by": "role:independent_auditor",
+            "status": "VERIFIED CLOSED" if ok else "BLOCKED: AWAITING MERCHANT REFUND CREDIT",
+            "receipt": {**body, "signature": rec["refund_sig"]} if ok else None}

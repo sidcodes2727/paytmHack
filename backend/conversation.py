@@ -6,17 +6,18 @@ from __future__ import annotations
 import re
 import uuid
 
+import claim_verifier
 import clock
 import ledger_db
+import merchant_rails
 import orchestrator as orc
 from mock_ledger import bank
-from untrusted_ingestion import ClaimedContext, scan_for_injection
+from untrusted_ingestion import ClaimedContext, extract_amounts, scan_for_injection, strip_refs
 
 ISSUE_RE = re.compile(r"refund|rfnd|pais|payment|pmt|\bkat|cut|debit|fail|fld|wapas|txn|transaction|upi|money|amount|"
-                      r"merchant|dukaan|double|dobara|do baar|credit|nahi aa|nhi a|ni aa|atak|अटक|reversal|₹|\brs\b|theek", re.I)
+                      r"merchant|dukaan|double|dobara|do baar|credit|nahi aa|nhi a|ni aa|atak|अटक|reversal|₹|\brs\b|theek|"
+                      r"cancel|radd|deliver|order|recharge|train|ticket|pnr|booking|return|khana|chargeback", re.I)
 STATUS_RE = re.compile(r"status|\bkab\b|kahan|update|kya hua|\bwhen\b|\bwhere\b|kitna time|kitne din", re.I)
-AMOUNT_RE = re.compile(r"(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{2,3})+|\d+(?:\.\d+)?)\s*(k\b)?", re.I)
-UNIT_AFTER = re.compile(r"^\s*(din|day|days|ghant|hour|hr|hrs|h\b|minute|min|baar|bar|x\b|dafa)", re.I)
 
 
 # Spoken Hinglish numbers (voice transcripts arrive as words: "teen sau pachaas", "ek chaar nau nau").
@@ -58,20 +59,6 @@ def spoken_to_digits(text: str) -> str:
     return " ".join(out)
 
 
-def extract_amounts(text: str) -> list[float]:
-    out = []
-    for m in AMOUNT_RE.finditer(text):
-        digits = m.group(1).replace(",", "")
-        if len(digits.split(".")[0]) > 7:          # UTRs / phone numbers are not amounts
-            continue
-        if UNIT_AFTER.match(text[m.end():]) and not m.group(2):
-            continue
-        v = float(digits) * (1000 if m.group(2) else 1)
-        if v >= 10:
-            out.append(v)
-    return out
-
-
 def _msg(conv: dict, sender: str, text: str, **kw) -> None:
     conv["messages"].append({"id": uuid.uuid4().hex, "from": sender, "text": text, "at": clock.now().isoformat(), **kw})
 
@@ -80,7 +67,8 @@ def _txn_chip(t: dict) -> dict:
     return {"label": f"₹{t['verified_amount']:,.0f} · {t['counterparty']}", "value": {"type": "txn", "txn_id": t["txn_id"]}}
 
 
-def _open(conv: dict, cid: str, txn_id: str, text: str, voice_mode: str | None, attachment: dict | None) -> str:
+def _open(conv: dict, cid: str, txn_id: str, text: str, voice_mode: str | None, attachment: dict | None,
+          refs: list[str] | None = None) -> str:
     existing = ledger_db.load_case(txn_id)
     if existing:
         c = orc.view_case(txn_id)
@@ -91,7 +79,8 @@ def _open(conv: dict, cid: str, txn_id: str, text: str, voice_mode: str | None, 
     ledger_db.save_conversation(conv)                 # open_case appends its own messages
     ocr = (attachment or {}).get("ocr")
     orc.open_case(cid, txn_id, "" if voice_mode else text, voice_transcript=text if voice_mode else "",
-                  voice_mode=voice_mode, ocr=ocr if ocr and ocr.get("amount") is not None else None, attachment=attachment)
+                  voice_mode=voice_mode, ocr=ocr if ocr and ocr.get("amount") is not None else None, attachment=attachment,
+                  refs=refs or [])
     return txn_id
 
 
@@ -107,7 +96,8 @@ def post_message(cid: str, text: str, *, choice: dict | None = None, voice_mode:
 
         if choice and choice.get("type") == "txn" and conv.get("pending"):
             p = conv["pending"]
-            case_id = _open(conv, cid, choice["txn_id"], p["text"], p.get("voice_mode"), p.get("attachment") or attachment)
+            case_id = _open(conv, cid, choice["txn_id"], p["text"], p.get("voice_mode"), p.get("attachment") or attachment,
+                            p.get("refs"))
             return {"conversation": orc.load_conversation(cid), "case_id": case_id}
 
         txns = bank.list_for_customer(cid)
@@ -130,7 +120,12 @@ def post_message(cid: str, text: str, *, choice: dict | None = None, voice_mode:
 
         pend_att = (conv.get("pending") or {}).get("attachment")
         attachment = attachment or pend_att
-        amounts = extract_amounts(text)
+        # References the customer quoted (PNR / order ID / payment RRN). They tell us where to look; the claim verifier
+        # later checks each one against the records, so quoting someone else's booking is caught, not trusted.
+        order_refs = merchant_rails.refs_in_text(text)
+        rrns = claim_verifier.rrns_in_text(text)
+        refs = [r["ref"] for r in order_refs] + rrns
+        amounts = extract_amounts(strip_refs(text, refs))
         ocr_amt = ((attachment or {}).get("ocr") or {}).get("amount")
         if not amounts and ocr_amt:
             amounts = [float(ocr_amt)]      # only used to *find* a transaction; the ledger amount is what counts
@@ -143,42 +138,63 @@ def post_message(cid: str, text: str, *, choice: dict | None = None, voice_mode:
                 ledger_db.save_conversation(conv)
                 return {"conversation": conv, "case_id": contained[0]["txn_id"]}
             target = next((t for t in txns if t["verified_amount"] in amounts), txns[0])
-            case_id = _open(conv, cid, target["txn_id"], text, voice_mode, attachment)
+            case_id = _open(conv, cid, target["txn_id"], text, voice_mode, attachment, refs)
             return {"conversation": orc.load_conversation(cid), "case_id": case_id}
 
-        # 2. amount mentioned -> match against the customer's own transactions
+        # 2. a quoted reference that points at one of the customer's own payments is an exact match
+        mine = {t["txn_id"]: t for t in txns}
+        exact = [r["payment_txn_id"] for r in order_refs if r["payment_txn_id"] in mine]
+        exact += [t["txn_id"] for t in txns if t.get("rrn") in rrns]
+        if exact:
+            case_id = _open(conv, cid, exact[0], text, voice_mode, attachment, refs)
+            return {"conversation": orc.load_conversation(cid), "case_id": case_id}
+        if refs:
+            # Quoted a reference that isn't theirs (or doesn't exist): open on the customer's own payment that best fits
+            # (same amount, else same merchant) so the verifier can record the contradiction on the audit trail.
+            foreign_merchants = {r["merchant_id"] for r in order_refs}
+            fit = [t for t in txns if any(abs(t["verified_amount"] - a) < 0.5 for a in amounts)] or \
+                  [t for t in txns if t.get("merchant_id") in foreign_merchants]
+            if len(fit) == 1:
+                case_id = _open(conv, cid, fit[0]["txn_id"], text, voice_mode, attachment, refs)
+                return {"conversation": orc.load_conversation(cid), "case_id": case_id}
+
+        # 3. amount mentioned -> match against the customer's own transactions
         if amounts:
             match = [t for t in txns if any(abs(t["verified_amount"] - a) < 0.5 for a in amounts)]
             if len(match) == 1:
-                case_id = _open(conv, cid, match[0]["txn_id"], text, voice_mode, attachment)
+                case_id = _open(conv, cid, match[0]["txn_id"], text, voice_mode, attachment, refs)
                 return {"conversation": orc.load_conversation(cid), "case_id": case_id}
-            conv["pending"] = {"text": text, "voice_mode": voice_mode, "attachment": attachment}
+            conv["pending"] = {"text": text, "voice_mode": voice_mode, "attachment": attachment, "refs": refs}
             lead = (f"Mujhe aapke account me ₹{amounts[0]:,.0f} ka koi transaction nahi mila." if not match
                     else "Is amount ke ek se zyada transactions hain.")
             _msg(conv, "vaada", f"{lead} Aap kis payment ki baat kar rahe hain?", chips=[_txn_chip(t) for t in (match or txns)])
             ledger_db.save_conversation(conv)
             return {"conversation": conv, "case_id": None}
 
-        # 3. follow-up on an open case
+        # 4. follow-up on an open case
         if open_cases and (STATUS_RE.search(text) or not ISSUE_RE.search(text)):
             c = open_cases[0]
             _msg(conv, "vaada", orc.status_text(c), case_id=c["txn_id"])
             ledger_db.save_conversation(conv)
             return {"conversation": conv, "case_id": c["txn_id"]}
 
-        # 4. small talk
+        # 5. small talk
         if not ISSUE_RE.search(text):
             _msg(conv, "vaada", "Main UPI payments aur refunds me madad karta hoon. Bataiye kya hua — jaise "
                                 "\"mera 350 ka refund nahi aaya\".")
             ledger_db.save_conversation(conv)
             return {"conversation": conv, "case_id": None}
 
-        # 5. issue without amount -> single problem txn is obvious; otherwise ask
-        problem = [t for t in txns if t["failure_stage"] != "NONE" and t["txn_id"] not in cases]
+        # 6. issue without amount -> a single obvious candidate; otherwise ask. "Cancelled / not delivered / recharge
+        #    failed" points at successful merchant payments; "money cut, refund not received" at failed payments.
+        if claim_verifier.claimed_reason(text):
+            problem = [t for t in txns if t["tx_type"] == "P2M" and t["failure_stage"] == "NONE" and t["txn_id"] not in cases]
+        else:
+            problem = [t for t in txns if t["failure_stage"] != "NONE" and t["txn_id"] not in cases]
         if len(problem) == 1:
-            case_id = _open(conv, cid, problem[0]["txn_id"], text, voice_mode, attachment)
+            case_id = _open(conv, cid, problem[0]["txn_id"], text, voice_mode, attachment, refs)
             return {"conversation": orc.load_conversation(cid), "case_id": case_id}
-        conv["pending"] = {"text": text, "voice_mode": voice_mode, "attachment": attachment}
+        conv["pending"] = {"text": text, "voice_mode": voice_mode, "attachment": attachment, "refs": refs}
         _msg(conv, "vaada", "Kaunsa payment? Neeche se chuniye:", chips=[_txn_chip(t) for t in (problem or txns)])
         ledger_db.save_conversation(conv)
         return {"conversation": conv, "case_id": None}

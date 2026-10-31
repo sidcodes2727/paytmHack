@@ -76,5 +76,15 @@ export const REASON: Record<string, string> = {
   HUMAN_APPROVED: "Approved by finance",
   ROLE_NOT_AUTHORIZED: "Caller role not authorised",
   INVALID_OR_EXPIRED_APPROVAL_TOKEN: "Approval token invalid or expired",
+  CLAIM_HISTORY_REVIEW: "Customer's claim history needs a human",
+  MERCHANT_RECORD_CONFIRMS_REFUND: "Merchant record confirms the refund",
+  FOREIGN_ORDER_CLAIMED: "Quoted another account's order",
+  FOREIGN_PAYMENT_CLAIMED: "Quoted another account's payment",
+  ORDER_NOT_OWNED_BY_CUSTOMER: "Order belongs to someone else",
+  CLAIM_CONTRADICTS_MERCHANT_RECORD: "Claim contradicts the merchant record",
+  NO_REFUND_DUE_UNDER_POLICY: "Nothing owed under merchant policy",
+  ALREADY_REFUNDED: "Already refunded",
+  CHARGEBACK_OPEN: "Chargeback already open (would pay twice)",
+  NOTHING_LEFT_TO_REFUND: "Nothing left to refund",
 };
 export const reason = (c: string) => REASON[c] ?? c.replace(/_/g, " ").toLowerCase();

@@ -8,8 +8,8 @@ import Phone from "./Phone";
 
 const WELCOME: CopilotMsg = {
   id: 0, from: "bot",
-  text: "Hi, I'm your ops copilot. Ask me why a case was routed the way it was, how the model performs, or drive the sandbox (\"fast-forward 18h\", \"bank settles this refund\").",
-  chips: ["How accurate is Nirnay?", "Queue status", "Show cost curve"],
+  text: "Hi, I'm your ops copilot. Ask why a case was routed the way it was, how a claim was verified, how the model performs, or drive the sandbox (\"fast-forward 18h\", \"bank settles this refund\").",
+  chips: ["How accurate is Nirnay?", "Show evidence", "Queue status", "Show cost curve"],
 };
 
 function Sandbox({ status, sel, run }: { status: Json; sel: string | null; run: (q: string) => void }) {

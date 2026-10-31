@@ -4,6 +4,31 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+AMOUNT_RE = re.compile(r"(?:₹|rs\.?|inr)?\s*(?<![\d-])(\d{1,3}(?:,\d{2,3})+|\d+(?:\.\d+)?)\s*(k\b)?", re.I)
+UNIT_AFTER = re.compile(r"^\s*(din|day|days|ghant|hour|hr|hrs|h\b|minute|min|baar|bar|x\b|dafa)", re.I)
+
+
+def extract_amounts(text: str) -> list[float]:
+    """Rupee amounts in free text. Skips references (UTRs, PNRs, phone numbers, FN-1234) and durations ("6 din")."""
+    out = []
+    for m in AMOUNT_RE.finditer(text or ""):
+        digits = m.group(1).replace(",", "")
+        if len(digits.split(".")[0]) > 7:
+            continue
+        if UNIT_AFTER.match(text[m.end():]) and not m.group(2):
+            continue
+        v = float(digits) * (1000 if m.group(2) else 1)
+        if v >= 10:
+            out.append(v)
+    return out
+
+
+def strip_refs(text: str, refs: list[str]) -> str:
+    for r in refs:
+        text = re.sub(re.escape(r).replace(r"\-", "-?"), " ", text, flags=re.I)
+    return text
+
+
 INJECTION_PATTERNS = [
     r"ignore (all |any )?(previous|prior|above) instructions", r"system\s*override", r"ignore\s+policy[_ ]?gate",
     r"\broute\s*=\s*autonomous", r"disable (the )?kill ?switch", r"developer mode", r"###\s*system",
@@ -26,6 +51,7 @@ class ClaimedContext(BaseModel):
     voice_transcript: str = ""
     voice_mode: Optional[str] = None
     ocr: Optional[OcrClaim] = None
+    refs: list[str] = []             # references the customer quoted (PNR, order ID, payment RRN): where to look, not proof
 
     @property
     def combined_text(self) -> str:
@@ -86,9 +112,9 @@ def claim_vs_fact(claim: ClaimedContext, v: VerifiedContext) -> dict:
         if claim.ocr.status and claim.ocr.status.upper() == "FAILED" and v.gateway_status == "SUCCESS" \
                 and v.bank_status.startswith("CREDITED_TO_BENEFICIARY"):
             mism.append({"field": "status", "claimed": claim.ocr.status, "ledger": v.bank_status})
-    m = re.search(r"(?:₹|rs\.?|inr)?\s*(\d[\d,]{2,})", claim.raw_text.lower())
-    if m and claim.ocr is None:
-        amt = float(m.group(1).replace(",", ""))
+    amts = extract_amounts(strip_refs(claim.raw_text, claim.refs))
+    if amts and claim.ocr is None:
+        amt = amts[0]
         if abs(amt - v.verified_amount) > 0.5 and amt >= 100:
             mism.append({"field": "text_amount", "claimed": amt, "ledger": v.verified_amount})
     return {"claim_ledger_mismatch": bool(mism), "mismatches": mism,

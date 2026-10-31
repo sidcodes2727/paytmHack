@@ -15,7 +15,7 @@ import orchestrator as orc
 import policy_gate
 import sarvam_adapter
 
-HELP_CHIPS = ["How accurate is Nirnay?", "Why was this case routed this way?", "Queue status", "Fast-forward 18h",
+HELP_CHIPS = ["How accurate is Nirnay?", "Why was this case routed this way?", "Show evidence", "Queue status", "Fast-forward 18h",
               "Bank settles this refund", "Simulate duplicate retry"]
 
 
@@ -78,7 +78,56 @@ def metrics(kind: str = "summary") -> dict:
         chips=["Show cost curve", "Show calibration", "Show OOD generalisation"])
 
 
+STATUS_ICON = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️"}
+
+
+def evidence(case: dict) -> dict:
+    ev = case.get("evidence")
+    if not ev:
+        return _reply("This case was contained before verification ran (prompt injection), so no evidence was gathered.")
+    rows = [[STATUS_ICON.get(c["status"], "·"), c["label"], f"{c['source_label']} ({c['trust'].lower()})", c["detail"]]
+            for c in ev["checks"]]
+    due = ev.get("amount_remaining") if ev["kind"] == "MERCHANT_REFUND" else ev.get("amount_due")
+    return _reply(
+        f"**Verdict: {ev['verdict'].replace('_', ' ')}**" + (f" · amount VAADA can act on: **₹{due:,.0f}**" if due else "") +
+        "\nOnly bank, merchant and history records can make a claim pass. The customer's words and screenshots can only make it "
+        "fail, by contradicting those records.",
+        cards=[{"type": "table", "columns": ["", "Check", "Source (trust)", "Finding"], "rows": rows}],
+        chips=["Why was this case routed this way?", "Show audit trail"])
+
+
+def _explain_merchant(case: dict) -> dict:
+    ev, v = case["evidence"], case["verified"]
+    o = ev.get("order") or {}
+    lines = [f"**{case['txn_id']}** · ₹{v['verified_amount']:,.0f} paid to {case['counterparty']} · {case['customer']['name']}",
+             f"- **Type:** the payment *succeeded*; the customer says something went wrong afterwards "
+             f"({(ev.get('claimed_reason') or 'unspecified').replace('_', ' ').lower()}). RBI's failed-payment TAT doesn't apply; "
+             f"the merchant's refund policy does.",
+             f"- **Route:** {case['triage']['label']} — {case['triage']['text']}"]
+    if o:
+        lines.append(f"- **Merchant record ({o['merchant_name']}):** {o['order_label']} {o['order_ref']} is "
+                     f"{o['status'].replace('_', ' ').lower()}" + (f" by {o['cancelled_by'].lower()}" if o.get("cancelled_by") else "") +
+                     f"; policy entitlement ₹{ev['amount_due']:,.0f}, already credited ₹{ev['amount_credited']:,.0f}.")
+    bad = [c for c in ev["checks"] if c["status"] in ("FAIL", "WARN")]
+    for c in bad[:4]:
+        lines.append(f"  - {STATUS_ICON[c['status']]} {c['label']}: {c['detail']}")
+    if case.get("gate"):
+        lines.append(f"- **Policy gate:** {case['gate']['decision']} — {', '.join(case['gate']['reason_codes'])}")
+    if case.get("promise"):
+        lines.append(f"- **Promise:** {case['promise']['draft']['what']}; closes only on `MERCHANT_REFUND_UTR_CREDITED`.")
+    lines.append(f"- Nirnay ran locally ({case['nirnay']['latency_ms']:.2f} ms) for the record, but merchant entitlement is "
+                 f"decided by the merchant's own data, not by a model.")
+    chips = ["Show evidence"]
+    if case["state"] == "AWAITING_APPROVAL":
+        chips += ["Approve this refund"]
+    elif case["state"] == "AWAITING_PROOF":
+        chips += ["Bank settles this refund", "Simulate duplicate retry"]
+    return _reply("\n".join(lines), chips=chips + ["Show audit trail"])
+
+
 def explain(case: dict) -> dict:
+    if case.get("kind") == "MERCHANT_REFUND" and case.get("outcome") != "CONTAINED":
+        return _explain_merchant(case)
     n, v, r = case["nirnay"], case["verified"], case["rbi"]
     lines = [f"**{case['txn_id']}** · ₹{v['verified_amount']:,.0f} {v['tx_type']} · {case['customer']['name']} → {case['counterparty']}"]
     lines.append(f"- **Nirnay** (local CPU, {n['latency_ms']:.2f} ms, {n['llm_calls']} LLM calls): issue `{n['issue_pred']}` at "
@@ -99,9 +148,10 @@ def explain(case: dict) -> dict:
         lines.append(f"- **Claim vs ledger:** customer said {m['claimed']}, ledger says {m['ledger']}.")
     if case.get("gate"):
         lines.append(f"- **Policy gate:** {case['gate']['decision']} — {', '.join(case['gate']['reason_codes'])}")
-    lines.append(f"- **RBI {r['tat_rule']}:** {r['days_elapsed']} days elapsed, "
-                 f"{'**breached**' if r['is_tat_breached'] else 'within ceiling'}; exposure ₹{r['accrued_compensation_inr']} "
-                 f"(liable: {r['liability_entity']}, not VAADA).")
+    if r:
+        lines.append(f"- **RBI {r['tat_rule']}:** {r['days_elapsed']} days elapsed, "
+                     f"{'**breached**' if r['is_tat_breached'] else 'within ceiling'}; exposure ₹{r['accrued_compensation_inr']} "
+                     f"(liable: {r['liability_entity']}, not VAADA).")
     if case.get("promise"):
         lines.append(f"- **Closes only on proof:** `{case['promise']['draft']['proof_check_id']}`.")
     chips = []
@@ -109,7 +159,7 @@ def explain(case: dict) -> dict:
         chips = ["Fast-forward 18h", "Approve this refund"]
     elif case["state"] == "AWAITING_PROOF":
         chips = ["Bank settles this refund", "Simulate duplicate retry"]
-    return _reply("\n".join(lines), chips=chips + ["Show audit trail"])
+    return _reply("\n".join(lines), chips=chips + ["Show evidence", "Show audit trail"])
 
 
 def queue_status() -> dict:
@@ -117,12 +167,12 @@ def queue_status() -> dict:
     groups = {}
     for c in cs:
         groups[c["group"]] = groups.get(c["group"], 0) + 1
-    exposure = sum(orc.view_case(c["txn_id"])["rbi"]["accrued_compensation_inr"] for c in cs
+    exposure = sum((orc.view_case(c["txn_id"])["rbi"] or {}).get("accrued_compensation_inr", 0) for c in cs
                    if c["group"] not in ("closed", "blocked"))
     spent = ledger_db.wallet_spent_last_hour()
     rows = [["Open cases", str(len(cs) - groups.get("closed", 0))], ["Needs approval", str(groups.get("approval", 0))],
             ["Awaiting bank proof", str(sum(1 for c in cs if c["state"] == "AWAITING_PROOF"))],
-            ["Blocked (security)", str(groups.get("blocked", 0))], ["Closed", str(groups.get("closed", 0))],
+            ["Blocked (security / contradicted claims)", str(groups.get("blocked", 0))], ["Closed", str(groups.get("closed", 0))],
             ["Agent wallet left this hour", f"₹{config.AGENT_WALLET_HOURLY_INR - spent:,.0f} of ₹{config.AGENT_WALLET_HOURLY_INR:,}"],
             ["RBI compensation exposure tracked", f"₹{exposure:,}"],
             ["Autopilot", "OFF (kill switch active)" if policy_gate.KILL_SWITCH_ACTIVE else "ON"],
@@ -176,12 +226,13 @@ def handle(text: str, case_id: str | None, role: str) -> dict:
             orc.reset()
             return _reply("Sandbox reset: ledger re-seeded, all cases and chats cleared, clock back to +0h.", changed=True)
         if not case:
-            if re.search(r"why|explain|kyun|reason|settle|webhook|utr|retry|duplicate|approve|reject|audit|chain", t):
+            if re.search(r"why|explain|kyun|reason|settle|webhook|utr|retry|duplicate|approve|reject|audit|chain|evidence|verif", t):
                 return _reply(need_case)
         else:
-            if not question and re.search(r"settle|webhook|bank confirm", t):
+            if not question and re.search(r"settle|webhook|bank confirm|credit", t):
                 r = orc.bank_settles(case["txn_id"])
-                return _reply(f"Bank posted a settled credit, UTR **{r['receipt']['utr']}**. The independent verifier checked "
+                src = "The merchant's refund reached the customer's bank" if case.get("kind") == "MERCHANT_REFUND" else "Bank posted a settled credit"
+                return _reply(f"{src}, UTR **{r['receipt']['utr']}**. The independent verifier checked "
                               f"the signed receipt → **{'VERIFIED CLOSED' if r['closed'] else 'still blocked'}**. "
                               f"Customer got a Hindi voice receipt.", changed=True)
             if not question and re.search(r"\bretry\b|duplicate retry|simulate duplicate|replay", t):
@@ -202,13 +253,15 @@ def handle(text: str, case_id: str | None, role: str) -> dict:
                 return _reply("Rejected. Case moved to manual review and the customer was told.", changed=True)
             if re.search(r"audit|chain|hash|tamper", t):
                 return audit(case)
+            if re.search(r"evidence|verif|fraud|checks|claim|saboot|proof of claim", t):
+                return evidence(case)
             if re.search(r"why|explain|kyun|reason|route|held|block|what happened", t):
                 return explain(case)
     except orc.ActionError as e:
         return _reply(f"⚠️ {e}")
 
     if sarvam_adapter.has_key():
-        ctx = {"case": {k: case[k] for k in ("txn_id", "state", "nirnay", "gate", "rbi", "triage", "promise")} if case else None,
+        ctx = {"case": {k: case.get(k) for k in ("txn_id", "kind", "state", "nirnay", "gate", "rbi", "sla", "triage", "promise", "evidence")} if case else None,
                "metrics": metrics()["cards"][0]["rows"]}
         r = sarvam_adapter.chat([
             {"role": "system", "content": "You are VAADA Ops Copilot for a UPI support team. Answer briefly and only from the "

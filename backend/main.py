@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import clock
@@ -203,3 +206,19 @@ def dup(txn_id: str):
 def reset():
     orc.reset()
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ built frontend (single-service deploy)
+FRONTEND_DIST = Path(os.environ.get("VAADA_FRONTEND_DIST") or config.BASE_DIR.parent / "frontend" / "dist")
+
+if FRONTEND_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa(path: str):
+        if path.startswith("api/"):
+            raise HTTPException(404)
+        f = (FRONTEND_DIST / path).resolve()
+        if path and f.is_file() and f.parent == FRONTEND_DIST.resolve():
+            return FileResponse(f)
+        return FileResponse(FRONTEND_DIST / "index.html")

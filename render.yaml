@@ -1,0 +1,18 @@
+# Render Blueprint: one Docker web service (API + built frontend on the same URL).
+services:
+  - type: web
+    name: vaada
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/status
+    autoDeploy: true
+    envVars:
+      - key: SARVAM_API_KEY          # set in the Render dashboard; without it VAADA runs its deterministic fallbacks
+        sync: false
+      - key: SARVAM_OCR_URL
+        value: https://api.sarvam.ai/doc-ai/v1/job/digitise
+      - key: VAADA_SECRET            # HMAC key for capability / approval tokens
+        generateValue: true
+      - key: VAADA_BANK_KEY          # HMAC key the mock bank signs receipts with
+        generateValue: true

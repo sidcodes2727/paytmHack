@@ -64,4 +64,29 @@ PROOF_CATALOG = {
     "GATEWAY_REVERSAL_CONFIRMED": "Gateway reversal record present and matched to a credited bank UTR",
     "MERCHANT_SETTLEMENT_CONFIRMED": "Merchant acquirer settlement confirmation with matching UTR",
     "DUPLICATE_REVERSAL_UTR": "Credited UTR for the duplicate (second) debit amount",
+    "MERCHANT_REFUND_UTR_CREDITED": "Merchant refund credited to the original payment source: signed receipt with a settled 12-digit UTR",
 }
+
+# --- Refunds owed after a *successful* payment (cancellation, non-delivery, return, failed fulfilment) ---------
+# Keyed by merchant category, then "<ORDER_STATUS>:<CANCELLED_BY>" ("*" = anyone). Entitlement:
+#   "full"       -> the whole payment is due
+#   "refundable" -> the merchant record's own refundable_amount (e.g. after cancellation charges)
+# sla_days are sandbox merchant policies, not regulation: in production they come from each merchant's published
+# refund policy (RBI's failed-transaction TAT does not apply because the payment itself succeeded).
+MERCHANT_REFUND_RULES = {
+    "TRAVEL": {"label": "Travel booking", "sla_days": 7,
+               "due": {"CANCELLED:MERCHANT": "full", "CANCELLED:SYSTEM": "full", "CANCELLED:CUSTOMER": "refundable"}},
+    "FOOD": {"label": "Food order", "sla_days": 2,
+             "due": {"CANCELLED:MERCHANT": "full", "CANCELLED:SYSTEM": "full", "NOT_DELIVERED:*": "full",
+                     "CANCELLED:CUSTOMER": "refundable"}},
+    "ECOMMERCE": {"label": "Online order", "sla_days": 7,
+                  "due": {"RETURNED:*": "refundable", "NOT_DELIVERED:*": "full", "CANCELLED:*": "full"}},
+    "RECHARGE": {"label": "Recharge / bill payment", "sla_days": 3, "due": {"FAILED_FULFILMENT:*": "full"}},
+    "SUBSCRIPTION": {"label": "Subscription", "sla_days": 7, "due": {"CANCELLED:CUSTOMER": "refundable"}},
+}
+MERCHANT_DISPUTE_SLA_HOURS = 72.0   # no connector: we promise the merchant's answer (dispute reference), not money
+
+# --- Claim history prior -----------------------------------------------------------------------------------------
+# Prior disputes (from the bank) + claims VAADA already found contradicted. At or above this, no refund runs without
+# a human, even when the records support the claim. It raises the evidence bar; it never rejects a claim by itself.
+CLAIM_HISTORY_REVIEW_THRESHOLD = 3

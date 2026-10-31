@@ -1,4 +1,4 @@
-import { Inbox as InboxIcon } from "lucide-react";
+import { Inbox as InboxIcon, Store, Zap } from "lucide-react";
 import { inr, Json } from "./api";
 
 const GROUPS: [string, string][] = [
@@ -7,7 +7,7 @@ const GROUPS: [string, string][] = [
 ];
 
 export const STATUS: Record<string, string> = {
-  AWAITING_APPROVAL: "Waiting for approval", AWAITING_PROOF: "Refund sent · awaiting bank proof",
+  AWAITING_APPROVAL: "Waiting for approval", AWAITING_PROOF: "Refund in progress · awaiting proof",
   VERIFIED_CLOSED: "Closed · verified", PROMISE_ACTIVE: "Promise active", OPEN_TRIAGED: "Triaged",
 };
 
@@ -16,6 +16,10 @@ export function statusLabel(c: Json) {
   if (c.outcome === "CONTAINED") return "Blocked · security";
   if (c.outcome === "NO_REFUND_DUE") return "Resolved · no refund due";
   if (c.outcome === "REJECTED") return "Manual review";
+  if (c.outcome === "CLAIM_CONTRADICTED") return "Blocked · claim contradicted";
+  if (c.outcome === "ALREADY_REFUNDED") return "Resolved · already refunded";
+  if (c.outcome === "DISPUTE_RAISED") return "Dispute raised with merchant";
+  if (c.outcome === "MANUAL_REVIEW") return "Manual review";
   if (c.group === "manual_review") return "Manual review";
   return STATUS[c.state] ?? c.state;
 }
@@ -51,7 +55,11 @@ export default function Inbox({ cases, sel, onSelect }: { cases: Json[]; sel: st
                     <span className="truncate text-sm font-medium text-slate-100">{c.customer}</span>
                     <span className="font-mono text-sm text-slate-200">{inr(c.amount)}</span>
                   </div>
-                  <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500">
+                  <div className="mt-0.5 flex items-center gap-1 truncate text-[11px] text-slate-500">
+                    {c.kind === "MERCHANT_REFUND" ? <Store size={11} className="shrink-0" /> : <Zap size={11} className="shrink-0" />}
+                    <span className="truncate">{c.kind === "MERCHANT_REFUND" ? "Merchant refund" : "Failed payment"} · {c.counterparty.split(" (")[0]}</span>
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-400">
                     {g !== "closed" && g !== "blocked" && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${riskTone(c.risk)}`} title={`Breach risk ${c.risk}/100`} />}
                     <span className="truncate">{statusLabel(c)}</span>
                   </div>

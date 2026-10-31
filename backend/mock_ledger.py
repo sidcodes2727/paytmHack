@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS mock_txn (
   txn_timestamp TEXT, gateway_status TEXT, bank_status TEXT, merchant_status TEXT,
   bank_webhook_received INTEGER DEFAULT 0, dispute_history_count INTEGER DEFAULT 0,
   failure_stage TEXT, counterparty TEXT, refund_status TEXT DEFAULT 'NONE', refund_ref TEXT,
-  refund_amount REAL, utr TEXT, utr_status TEXT, settled_at TEXT, receipt_sig TEXT
+  refund_amount REAL, utr TEXT, utr_status TEXT, settled_at TEXT, receipt_sig TEXT,
+  merchant_id TEXT, rrn TEXT
 );
 """
 
@@ -64,6 +65,12 @@ class MockBank:
         with _conn() as c:
             rows = c.execute("SELECT * FROM mock_txn WHERE customer_id=? ORDER BY txn_timestamp DESC", (customer_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    def find_by_rrn(self, rrn: str) -> dict | None:
+        """The payment's own 12-digit UPI reference (shown in every UPI app), not the refund UTR."""
+        with _conn() as c:
+            r = c.execute("SELECT * FROM mock_txn WHERE rrn=?", (rrn,)).fetchone()
+        return dict(r) if r else None
 
     def initiate_refund(self, txn_id: str, amount: float, idem_key: str) -> dict:
         """Refund API. Always answers 202 Accepted: acceptance is NOT settlement."""
