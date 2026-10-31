@@ -10,8 +10,8 @@ function inline(s: string): ReactNode[] {
   while ((m = re.exec(s))) {
     if (m.index > last) out.push(clean(s.slice(last, m.index)));
     const t = m[0];
-    if (t.startsWith("**")) out.push(<strong key={m.index} className="font-semibold text-white">{clean(t.slice(2, -2))}</strong>);
-    else out.push(<code key={m.index} className="rounded bg-white/10 px-1 py-0.5 font-mono text-[0.85em]">{t.slice(1, -1)}</code>);
+    if (t.startsWith("**")) out.push(<strong key={m.index} className="font-semibold text-ink">{clean(t.slice(2, -2))}</strong>);
+    else out.push(<code key={m.index} className="rounded-[4px] bg-sunk px-1 py-px font-mono text-[0.86em] text-ink">{t.slice(1, -1)}</code>);
     last = m.index + t.length;
   }
   if (last < s.length) out.push(clean(s.slice(last)));
@@ -27,8 +27,8 @@ export function Markdown({ text }: { text: string }) {
         if (t.startsWith("- ")) {
           const nested = l.length - t.length >= 2;
           return (
-            <div key={i} className={`flex gap-2 ${nested ? "pl-4 text-[0.95em] text-slate-400" : ""}`}>
-              <span className={`mt-[7px] h-1 w-1 shrink-0 rounded-full ${nested ? "bg-slate-600" : "bg-slate-500"}`} /><span>{inline(t.slice(2))}</span>
+            <div key={i} className={`flex gap-2 ${nested ? "pl-4 text-[0.95em] text-ink-3" : ""}`}>
+              <span className={`mt-[8px] h-px w-2 shrink-0 ${nested ? "bg-ink-4" : "bg-ink-3"}`} /><span>{inline(t.slice(2))}</span>
             </div>
           );
         }

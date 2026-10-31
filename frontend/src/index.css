@@ -1,7 +1,54 @@
 @import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+@import "@fontsource/instrument-serif";
+@import "@fontsource/instrument-serif/400-italic.css";
 
-:root { color-scheme: dark; }
-body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; background: #020617; color: #e2e8f0; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+/* VAADA design tokens: warm paper, ink, hairlines, one accent (sindoor). */
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
+
+  --color-paper: #f6f5f1;
+  --color-card: #ffffff;
+  --color-sunk: #efede7;
+  --color-line: #e5e2da;
+  --color-line-strong: #cfcabf;
+  --color-ink: #16140f;
+  --color-ink-2: #4f4b42;
+  --color-ink-3: #8a8578;
+  --color-ink-4: #b5b0a4;
+
+  --color-sindoor: #d2471f;
+  --color-sindoor-soft: #fbece6;
+  --color-ok: #16704a;
+  --color-ok-soft: #e8f2ec;
+  --color-warn: #9a5800;
+  --color-warn-soft: #fbf1e0;
+  --color-bad: #b42318;
+  --color-bad-soft: #fbebe9;
+  --color-info: #1f4fb5;
+  --color-info-soft: #e9eefa;
+}
+
+:root { color-scheme: light; }
+html, body { background: var(--color-paper); }
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "ss01", "cv11";
+}
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.eyebrow { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-ink-3); }
+::selection { background: var(--color-sindoor-soft); color: var(--color-ink); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--color-line-strong); border-radius: 10px; border: 3px solid var(--color-paper); }
+::-webkit-scrollbar-track { background: transparent; }
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.rise { animation: rise 0.22s ease-out both; }
+@keyframes breathe { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+.breathe { animation: breathe 1.4s ease-in-out infinite; }

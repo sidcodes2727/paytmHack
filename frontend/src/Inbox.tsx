@@ -1,9 +1,9 @@
-import { Inbox as InboxIcon, Store, Zap } from "lucide-react";
 import { inr, Json } from "./api";
+import { Dot } from "./ui";
 
 const GROUPS: [string, string][] = [
   ["approval", "Needs approval"], ["in_progress", "In progress"], ["manual_review", "Manual review"],
-  ["blocked", "Blocked"], ["closed", "Closed"],
+  ["blocked", "Blocked"], ["closed", "Resolved"],
 ];
 
 export const STATUS: Record<string, string> = {
@@ -24,17 +24,18 @@ export function statusLabel(c: Json) {
   return STATUS[c.state] ?? c.state;
 }
 
+const GROUP_TONE: Record<string, string> = { approval: "amber", in_progress: "blue", manual_review: "amber", blocked: "red", closed: "slate" };
+
 function riskTone(r: number) {
-  return r >= 75 ? "bg-rose-400" : r >= 40 ? "bg-amber-400" : "bg-emerald-400";
+  return r >= 75 ? "red" : r >= 40 ? "amber" : "green";
 }
 
 export default function Inbox({ cases, sel, onSelect }: { cases: Json[]; sel: string | null; onSelect: (id: string) => void }) {
   if (!cases.length)
     return (
-      <div className="flex h-full flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 p-6 text-center">
-        <InboxIcon className="mb-3 text-slate-600" />
-        <div className="text-sm font-medium text-slate-300">No cases yet</div>
-        <div className="mt-1 text-xs text-slate-500">Send a message from the customer phone. VAADA will find the transaction and open a case here.</div>
+      <div className="rounded-lg border border-dashed border-line-strong px-5 py-10 text-center">
+        <div className="font-serif text-[20px] text-ink">Nothing yet.</div>
+        <p className="mx-auto mt-2 max-w-[200px] text-[12.5px] leading-relaxed text-ink-3">Send a message from the customer's phone. Vaada finds the payment and opens a case here.</p>
       </div>
     );
   return (
@@ -44,27 +45,30 @@ export default function Inbox({ cases, sel, onSelect }: { cases: Json[]; sel: st
         if (!items.length) return null;
         return (
           <div key={g}>
-            <div className="mb-2 flex items-center justify-between px-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-              {label}<span className="rounded-full bg-white/5 px-2 py-0.5 text-slate-400">{items.length}</span>
+            <div className="mb-1.5 flex items-center gap-2 px-1">
+              <Dot tone={GROUP_TONE[g]} /><span className="eyebrow">{label}</span><span className="num ml-auto text-[11px] text-ink-3">{items.length}</span>
             </div>
-            <div className="space-y-1.5">
-              {items.map((c) => (
-                <button key={c.txn_id} onClick={() => onSelect(c.txn_id)}
-                  className={`w-full rounded-xl border px-3 py-2.5 text-left transition ${sel === c.txn_id ? "border-emerald-500/40 bg-emerald-500/[0.07]" : "border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.05]"}`}>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-medium text-slate-100">{c.customer}</span>
-                    <span className="font-mono text-sm text-slate-200">{inr(c.amount)}</span>
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-1 truncate text-[11px] text-slate-500">
-                    {c.kind === "MERCHANT_REFUND" ? <Store size={11} className="shrink-0" /> : <Zap size={11} className="shrink-0" />}
-                    <span className="truncate">{c.kind === "MERCHANT_REFUND" ? "Merchant refund" : "Failed payment"} · {c.counterparty.split(" (")[0]}</span>
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-400">
-                    {g !== "closed" && g !== "blocked" && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${riskTone(c.risk)}`} title={`Breach risk ${c.risk}/100`} />}
-                    <span className="truncate">{statusLabel(c)}</span>
-                  </div>
-                </button>
-              ))}
+            <div className="overflow-hidden rounded-lg border border-line bg-card">
+              {items.map((c, i) => {
+                const active = sel === c.txn_id;
+                return (
+                  <button key={c.txn_id} onClick={() => onSelect(c.txn_id)}
+                    className={`relative block w-full px-3.5 py-3 text-left transition-colors ${i ? "border-t border-line" : ""} ${active ? "bg-sunk" : "hover:bg-[#faf9f6]"}`}>
+                    {active && <span className="absolute inset-y-0 left-0 w-[3px] bg-sindoor" />}
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="truncate text-[13.5px] font-medium text-ink">{c.customer}</span>
+                      <span className="num text-[13px] text-ink">{inr(c.amount)}</span>
+                    </div>
+                    <div className="mt-0.5 truncate text-[12px] text-ink-3">
+                      {c.kind === "MERCHANT_REFUND" ? "Merchant refund" : "Failed payment"} · {c.counterparty.split(" (")[0]}
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1.5 text-[12px] text-ink-2">
+                      {g !== "closed" && g !== "blocked" ? <Dot tone={riskTone(c.risk)} pulse={c.crew_running} /> : null}
+                      <span className="truncate">{statusLabel(c)}</span>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           </div>
         );
